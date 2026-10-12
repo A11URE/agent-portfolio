@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>电解铝知识库 · 数据流搭建（V2）</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body {
+    font-family: "Microsoft YaHei", sans-serif;
+    margin: 0;
+    padding: 44px 20px 60px;
+    background: #f8fafc;
+    color: #1e3a5f;
+  }
+  h1 {
+    font-size: 28px;
+    font-weight: 800;
+    color: #1e3a5f;
+    border-left: 5px solid #3b82f6;
+    padding-left: 14px;
+    text-align: left;
+  }
+  .subtitle { color: #64748b; font-size: 14px; margin: 8px 0 0 19px; }
+  h2 {
+    color: #1e3a5f;
+    font-size: 19px;
+    font-weight: 700;
+    border-left: 4px solid #3b82f6;
+    padding-left: 10px;
+    margin-top: 46px;
+    text-align: left;
+  }
+  .mermaid {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 28px;
+    text-align: center;
+    box-shadow: 0 2px 10px rgba(30,58,95,.05);
+  }
+  .note {
+    color: #64748b;
+    font-size: 13px;
+    margin-top: 8px;
+    text-align: left;
+    padding-left: 4px;
+  }
+</style>
+</head>
+<body>
+
+<h1>电解铝知识库 · 数据流搭建</h1>
+<p class="subtitle">从原始资料到可检索知识库的完整数据链路 · 覆盖第一 ~ 五周</p>
+
+<h2>一、数据流全景</h2>
+<div class="mermaid">
+flowchart TD
+    Prep(("🛠️ 准备阶段<br/>搭建脚本 + 规则"))
+
+    Prep --> Src[/"📦 源数据采集<br/>MinIO 78 份原始资料"/]
+
+    Src --> Extract["🔧 提取转换 doc_extractor"]
+
+    Extract -->|"文字层正常"| Normal("📄 普通文档<br/>PyMuPDF")
+    Extract -->|"字符乱码"| Garbled("🔤 国标乱码<br/>RapidOCR")
+    Extract -->|"无文字层"| Scanned("🖼️ 扫描版<br/>PP-StructureV3")
+
+    Normal --> ImgLabel
+    Garbled --> ImgLabel
+    Scanned --> ImgLabel
+
+    ImgLabel["🖼️ 图片标注<br/>提取插图 + 千问描述"]
+
+    ImgLabel --> Output[/"📦 产出"/]
+
+    Output --> MD["📄 MD 标准文件"]
+    Output --> ImgProd["🖼️ 图片 + 图片信息"]
+
+    subgraph TextLine["📄 文字线"]
+        MD --> PG[("🗄️ PostgreSQL<br/>75 份")]
+        PG --> Slice["✂️ 切片 BGE-M3<br/>（25,304 条）"]
+        Slice --> Clean{"🧹 数据清洗<br/>（保留 23,414 条<br/>隔离 1,879 条）"}
+        Clean --> Mongo[("📚 MongoDB<br/>（25,304 切片）")]
+        Mongo --> Emb["🧮 向量化 BGE-M3<br/>（23,414 条）"]
+        Emb --> Qdrant[("🔍 Qdrant<br/>（23,414 向量）")]
+    end
+
+    subgraph KGLine["🧩 图谱线"]
+        ImgProd --> ImgClean{"🖼️ 图片清洗<br/>人工审核"}
+        ImgClean --> ImgEnt["🖼️ 图片实体"]
+        ImgEnt --> Neo4j[("🧩 Neo4j")]
+        ImgClean --> ExtractEnt["🔗 抽取实体<br/>图注 + 描述"]
+        ExtractEnt -->|"depicts"| ImgEnt
+        ExtractEnt --> Neo4j
+        Slice --> Triple["🔗 抽取三元组<br/>人工审核"]
+        Triple --> Neo4j
+    end
+
+    classDef start fill:#3b82f6,stroke:#3b82f6,color:#ffffff;
+    classDef db fill:#eff6ff,stroke:#3b82f6,color:#1e3a5f;
+    classDef plain fill:#ffffff,stroke:#3b82f6,color:#1e3a5f;
+    classDef branch fill:#f0f7ff,stroke:#60a5fa,color:#1e3a5f;
+    classDef judge fill:#f0f7ff,stroke:#3b82f6,color:#1e3a5f;
+    classDef kg fill:#f5f3ff,stroke:#8b5cf6,color:#4c1d95;
+    classDef out fill:#dbeafe,stroke:#2563eb,color:#1e3a5f;
+
+    class Prep start;
+    class PG,Mongo,Qdrant db;
+    class Src,Extract,Slice,Emb,ImgLabel,MD,ImgProd plain;
+    class Normal,Garbled,Scanned branch;
+    class Clean,ImgClean judge;
+    class ImgEnt,Neo4j,ExtractEnt,Triple kg;
+    class Output out;
+</div>
+<p class="note">提取转换产出两条线：MD 标准文件走「文字线」（PostgreSQL → 切片 → 清洗 → 向量化 → Qdrant）；图片及图片信息走「图谱线」（图片清洗人工审核 → 图片实体 + 图注/描述抽实体 → depicts 三元组 → Neo4j）。</p>
+
+<h2>二、三种文档 → 三种处理方法</h2>
+<div class="mermaid">
+flowchart LR
+    Open["打开一份 PDF<br/>抽样看前 10 页"]
+
+    Open --> J{"判断文字层"}
+
+    J -->|"有正常文字层"| A1("📄 普通文档")
+    J -->|"有文字层但乱码"| A2("🔤 国标乱码 PDF")
+    J -->|"无文字层"| A3("🖼️ 扫描版 PDF")
+
+    A1 --> B1["PyMuPDF 提文字层 + 内嵌图片<br/>→ 完整 MD + 图片清单"]
+    A2 --> B2["is_garbled 逐页判乱码<br/>乱码页 RapidOCR 整页兜底<br/>→ OCR 后正文"]
+    A3 --> B3["PaddleOCR PP-StructureV3 版面分析<br/>+ 纯 OCR 提文字<br/>像素边界检测裁剪插图<br/>表格转 Markdown、公式转平排<br/>跨页上下文 + 图注<br/>→ 正文 + 插图 + 表格 + 公式"]
+
+    B1 --> Merge[/"汇合 → 统一 MD 入库"/]
+    B2 --> Merge
+    B3 --> Merge
+
+    classDef j fill:#f0f7ff,stroke:#3b82f6,color:#1e3a5f;
+    classDef n fill:#f0f7ff,stroke:#60a5fa,color:#1e3a5f;
+    classDef b fill:#ffffff,stroke:#3b82f6,color:#1e3a5f;
+    classDef m fill:#3b82f6,stroke:#3b82f6,color:#ffffff;
+    class J j;
+    class A1,A2,A3 n;
+    class B1,B2,B3 b;
+    class Merge m;
+</div>
+<p class="note">每种文件「对应的问题 → 用什么方法 → 产出什么」一目了然。</p>
+
+<h2>三、质量保证 · 三把锁</h2>
+<div class="mermaid">
+flowchart LR
+    subgraph L1["入库前 · 第二周"]
+        A["数量对账<br/>输入=成功+失败"]
+        B["抽查校验<br/>贺骁原文核对"]
+        C["版本记录<br/>可追溯"]
+    end
+    subgraph L2["入库后 · 第四周"]
+        D["dry-run 试运行<br/>不动真数据"]
+        E["抽样核对<br/>发现规则误报"]
+        F["修复 + 回滚<br/>分三批 0 失败"]
+    end
+    subgraph L3["图片描述 · 第五周"]
+        G["逐张验证<br/>描述准确无幻觉"]
+        H["证据链<br/>基于图注+上下文"]
+    end
+
+    classDef l fill:#eff6ff,stroke:#3b82f6,color:#1e3a5f;
+    class A,B,C,D,E,F,G,H l;
+</div>
+<p class="note">每一环都设质量关卡：入库前对账抽查、入库后清洗回滚、图片描述靠证据不瞎编。</p>
+
+<script>mermaid.initialize({startOnLoad:true, theme:'base', useMaxWidth:true, themeVariables:{fontFamily:'Microsoft YaHei', lineColor:'#94a3b8', fontSize:'13px'}});</script>
+</body>
+</html>

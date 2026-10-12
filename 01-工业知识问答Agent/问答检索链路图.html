@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>电解铝知识库问答 · 检索链路图</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body { font-family: "Microsoft YaHei", sans-serif; margin: 20px; background: #f8f9fa; color: #1f2937; }
+  h1 { border-left: 5px solid #d97706; padding-left: 12px; }
+  h2 { margin-top: 40px; color: #1f2937; border-bottom: 1px solid #e5e7eb; padding-bottom: 6px; }
+  h3 { margin-top: 24px; color: #374151; }
+  .mermaid { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; overflow-x: auto; }
+  .note { color: #6b7280; font-size: 14px; margin-top: 6px; }
+  .warn { color: #92400e; font-size: 14px; margin-top: 6px; background: #fffbeb; border-left: 3px solid #d97706; padding: 6px 10px; border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; background: white; font-size: 14px; margin-top: 10px; }
+  th, td { border: 1px solid #e5e7eb; padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: #f3f4f6; }
+  code { background: #f3f4f6; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+  pre { background: #1f2937; color: #e5e7eb; padding: 14px; border-radius: 8px; font-size: 13px; overflow-x: auto; line-height: 1.5; }
+  ol li, ul li { margin: 4px 0; }
+</style>
+</head>
+<body>
+<h1>电解铝知识库问答 · 检索链路（用户提问 → 最终结果）</h1>
+<p class="note">kwp 前端 :3000 · qa-backend :8003 · agent 检索服务 :8010（LangGraph 管线）· <b>2026-10-09 按当前代码逐层重新核实</b>（chenyang 分支，所有行号为实测）</p>
+<p class="note">本版取代 2026-10-06 版。六处实质差异见文末「与 20261006 版的差异」。详版（含全部 file:line 锚点）见 <code>docs/问答检索链路流程图.md</code>。</p>
+
+<h2>一、全链路总览（三层 + 帧源分叉 + 回程）</h2>
+<div class="mermaid">
+flowchart TD
+    User[/"用户提问：文字 + 可选图片<br/>可勾选知识库 / 图谱范围"/]
+
+    User --> FE["kwp 前端 :3000　send()"]
+
+    FE -->|"新提问一律流式<br/>（五种模式 + 带附图都不例外）"| STREAM["流式：POST /api/convs/{id}/ask/stream<br/>气泡先显示阶段文案 + 三点动画<br/>正文 80ms 节流逐字长出"]
+    FE -->|"仅失败消息重试<br/>（流式没有对应重试端点）"| ONESHOT["一次性：POST …/messages/{id}/retry<br/>原位换掉那条 failed 气泡"]
+
+    STREAM --> BIZS["qa-backend :8003<br/>归属校验 → user 消息先落 SQLite → db.close()<br/>_stream_frames 按模式选帧源"]
+    ONESHOT --> BIZ["qa-backend :8003<br/>归属校验 → user 消息先落 SQLite<br/>转发 agent（multipart）：question / top_k=8<br/>/ kbs / kgs / 首图 / output_type<br/>conversation_id = 会话ID#记忆序号"]
+
+    BIZS -->|"mode = retrieve<br/>该通道没有大模型生成"| PSEUDO["<b>伪流式（8003 自产帧）</b><br/>start → step(检索中/检索完, 带耗时)<br/>→ 拼好的正文按行当 token 推 → done<br/>帧合同与真流式完全一致，前端不分叉"]
+    BIZS -->|"rag / agent / excel / doc<br/>（含带附图）"| AGENT["agent 检索服务 :8010<br/>限流 + 输入过滤（问题 ≤500 字）<br/>KBService.chat_stream / chat 主管线"]
+    BIZ --> AGENT
+
+    AGENT --> PIPE["检索管线（见第二节）<br/>记忆改写 → 意图（含非知识类分流）<br/>→ 三路并检 → 充分性判定 → 补检循环<br/>→ 生成（可流式）→ 证据定序"]
+
+    PIPE --> BACK["回程：qa-backend 规范化<br/>来源字段白名单过滤（保留 imageId / kgId）<br/>流式：<b>done 帧到达才落 assistant</b><br/>断流/error：failed=True 落库衔接重试"]
+    PSEUDO --> BACK
+
+    BACK --> RENDER[/"kwp 渲染：done.answer 覆盖本地拼接<br/>答案 + 可点引用 [[n]] · route 徽标<br/>右栏证据面板（文档/图谱/图片/联网 分组）<br/>图片缩略图 · Excel/Word 附件下载卡"/]
+</div>
+<p class="note">多轮记忆在 agent 侧（Mongo sessions）：业务后端不上送历史，只传 conversation_id；「清空对话」= 记忆序号 +1，让 agent 侧记忆重置。qa-backend 自己的会话/消息存 SQLite（不是 Mongo）。</p>
+<p class="note">超时链：kwp 首帧 150s（<b>不设整体超时</b>，首字延迟实测抖动 5.5s~44s）→ qa-backend rag 120s / agent 180s（流式按帧间隔天然适配）→ agent 200s。并发闸：8003 侧 <code>Semaphore(3)</code>，流式是<b>整条流占一个名额</b>（= 同时最多 3 条流）。</p>
+<p class="note"><b>流式范围（20261009 收口）</b>：新提问<b>全部</b>走 SSE —— 带附图（图只是给模型多一份上下文，检索进度由 <code>step</code> 帧承担）、生成表格 / 生成文档（回答照常逐字推，附件挂 <code>done.files</code>）都是<b>真流式</b>；仅检索因为<b>没有大模型生成</b>（正文由 8003 拼装），改由 8003 做<b>伪流式</b>：帧合同一模一样，只是 <code>step</code> 报检索进度、正文按行当 <code>token</code> 推。前端因此<b>不留模式分支</b>，一次性只剩失败重试。</p>
+<p class="note"><b>两处「token 拼接 ≠ done 正文」是设计内的</b>（真机实测），靠前端用 <code>done.answer</code> 覆盖自愈：① 区间波浪线归一只在定稿做（<code>955~985℃</code> → <code>955–985℃</code>，1312 字等长替换，不改就会撞上 marked 的单波浪线删除线规则）；② 表格/文档的附件导语在工具跑完后才存在，定稿 = 导语 + 空行 + 已流完的正文（实测 43 字，收尾一瞬插到正文最前）。</p>
+
+<h2>二、agent 主管线（LangGraph 节点流转）</h2>
+<div class="mermaid">
+flowchart TD
+    IN[/"问题 + 会话ID + 可选图片/范围"/]
+
+    IN --> MEM["① 读记忆<br/>Mongo 取最近 2 轮对话<br/>追问改写：「它的温度呢」→ 补全成完整问题<br/>（改写失败直通原问题）"]
+
+    MEM --> INTENT["② 意图节点 spa（1 次大模型调用）<br/>13 个专业标签 + 5 档非知识类<br/>+ 查询实体 + 是否要搜图<br/>+ 拆 ≤2 个子问题 + BM25 关键词<br/>（规则层完全匹配命中时零 LLM 成本）"]
+
+    INTENT --> ROUTE{"route_after_spa<br/>条件边"}
+
+    ROUTE -->|"非知识类 且 置信 ≥0.8"| DIRECT["ⓓ direct 直答节点<br/>固定文案 / 模型直答+免责<br/>short_circuited ⇒ 节点补推一帧 token<br/>→ END（压根不检索，1.5~3.3s）"]
+    ROUTE -->|"专业问题 / 置信不足 / 开关关闭"| PLANNER["③ planner 检索规划<br/>复用 spa 结果，不再调 LLM"]
+
+    PLANNER --> KG["④a 图谱检索（Neo4j）"]
+    PLANNER --> RAG["④b 文本 + 图片检索（Qdrant + Mongo）<br/>原问题 + 子问题并发，合并按分截 top_k"]
+
+    KG --> FUSE["⑤ fusion 充分性判定<br/>规则优先：文本 ≥3 条且最高分 ≥0.8 即够<br/>边缘情形才让大模型裁定"]
+    RAG --> FUSE
+
+    FUSE --> LOOP{"⑥ loop 补检判定"}
+    LOOP -->|"realtime_web 且联网真可用"| WEB["⑦ web_search 联网兜底<br/>第 0 轮快速通道直达，省掉一整轮补检"]
+    LOOP -->|"不够 且 补检 少于 3 轮"| SUPP["补检：大模型出 ≤3 个补检问题<br/>rag_refine 重检文本（text_only，<br/>首轮的命中并回，不丢）"]
+    SUPP --> REFUSE["refusion 再次融合"] --> LOOP
+
+    LOOP -->|"够 / 轮次用完 且 证据薄弱"| WEB
+    LOOP -->|"够 / 轮次用完"| REASON["⑧ reason 生成（大模型）<br/>零证据 → 短路「证据不足」不调模型<br/>有证据 → 按 [[n]] 编号引用作答<br/><b>流式时逐 token 推给前端</b>"]
+    WEB --> REASON
+
+    REASON --> ENUM["⑨ 证据统一定序<br/>文本 → 图谱 → 图片(≤3) → 联网<br/>各类 ≤8 条，编号从 1 起<br/>（[[n]] 与来源列表唯一对应来源）"]
+
+    ENUM --> ART{"output_type？"}
+    ART -->|"excel / doc"| FILES["附件生成：xlsx / docx<br/>data URL 直供前端下载，不落库"]
+    ART -->|"普通问答"| OUT["返回 JSON / done 帧"]
+    FILES --> OUT
+    DIRECT --> OUTD["返回 JSON / done 帧<br/>route = direct，sources 空"]
+
+    OUT --> MEMW["⑩ 记忆写回 Mongo<br/>超 6000 字自动压缩<br/>（流式路径：写路径全部在 done 帧之前）"]
+</div>
+<p class="note">「补检 N 轮」提示：fusion 判定证据不够时，会让大模型出补充问题再检，最多 3 轮；前端会显示补检轮数。</p>
+<p class="note">零证据不调模型：三路检索全空时直接返回「现有知识库证据不足」，不编答案。<b>但非知识类问题现在到不了这一步</b>——spa 之后就 direct 短路了。</p>
+<p class="note"><code>route</code> 共六个值：<code>vector</code> / <code>graph_rag</code> / <code>llm_fallback</code> / <code>web_search</code> / <code>direct</code> /（<code>/api/agent_chat</code> 固定 <code>agent</code>）。</p>
+
+<h2>三、检索细节 Ⅰ：文本线（Qdrant 文本库 + MongoDB）</h2>
+<div class="mermaid">
+flowchart TD
+    Q["问题（原问题 + ≤2 个子问题并发，各自走完整管线后合并）"]
+
+    Q --> SPLIT{"ENABLE_SPARSE = true（当前已开）"}
+
+    SPLIT --> D1["①a Dense 语义召回 Top 30<br/>BGE-M3 把问题编码成 dense 向量<br/>→ Qdrant 文本库（4951 点）近邻搜索"]
+    SPLIT --> D2["①b BM25 稀疏召回<br/>意图节点产的 bm25_keywords<br/>→ 集合内 bm25_sparse 向量（服务端 IDF 推理）<br/>精确术语 / 型号 / 规程编号是 dense 的弱项"]
+
+    D1 --> RRF["② 应用层 RRF 融合（k=60，<b>等权</b>）<br/>两路分别查、按排名倒数在应用层融合<br/>不用服务端 FusionQuery：融合结果不携带<br/>「该点由哪一路召回」，sources.kind 就丢了"]
+    D2 --> RRF
+
+    RRF --> T2["③ 精排留 12<br/>BGE-reranker-v2-m3 对候选逐条<br/>与问题配对打相关性分（0~1）<br/>按分降序保留前 12 条"]
+
+    T2 --> T3{"④ 精排分下限过滤<br/>EVIDENCE_MIN_SCORE（默认 0.6）"}
+    T3 -->|"全部低于阈值"| T3X["返回空 + 警告「证据不足」<br/>不把无关片段凑数当证据<br/>（防离题问题显示 1%、2% 相似度）"]
+    T3 -->|"有存活"| T4["⑤ 三级去重<br/>1. 同 chunk_id 只留一次（双路命中合并）<br/>2. 全文哈希完全相同剔除<br/>3. 近重复剔除：字符 3-gram Jaccard ≥0.6<br/>（滑窗重叠切片只留精排分更高者）"]
+
+    T4 --> T5["⑥ 每文档配额 ≤6 条种子<br/>防单篇长文档霸屏，保证证据多样性"]
+
+    T5 --> T6["⑦ 上下文扩展<br/>按种子的前后指针回 Mongo 取<br/>前 1 段 + 后 1 段，拼完整语境<br/>（Mongo 失败降级为仅种子 + 警告）"]
+
+    T6 --> T7["⑧ 预算裁剪<br/>按精排排名累计正文长度<br/>超 8000 token 即停止纳入，再截 top_k<br/>（中文按 1 字 1 token 保守估计）"]
+
+    T7 --> T8[/"⑨ 文本证据（带引用）<br/>每条含：正文 / 书名 / 页码 / chunk_id<br/>/ MinIO 原文位置 / score=精排分<br/><b>kind = vector 或 bm25</b>（哪路召回的）<br/>fusion_score=召回 RRF 分（仅调试）"/]
+</div>
+<p class="note">调参依据（2026-08-28 真实库实验）：精排保留 8→12 让排序第 6~7 位的高相关证据（安全规程、异常处理专节）进种子池；每文档配额 4→6 因近重复去重上线后重叠切片不再占名额。近重复阈值 0.6 校准自真实库：同文档相邻不同节 J≈0.44、滑窗重叠对 J≈0.68，两侧均有余量。</p>
+<p class="note">RRF 等权依据（week5 评测数据）：等权 + 小候选池最优，给 BM25 降权反而变差。任何调参前后各跑一次 <code>serve/eval/run_eval.py</code>（<code>--url</code> 必须显式传隧道口 <b>16365</b>，默认值 16335 打不通），再用 <code>compare_eval.py a.json b.json</code> 出对比表。</p>
+<p class="note">管线五阶段（召回/精排/去重配额/上下文扩展/预算裁剪）逐步上报进度，调试页可看每阶段耗时与进出条数。</p>
+
+<h2>三、检索细节 Ⅱ：图片线（Qdrant 图片库，1145 张）</h2>
+<div class="mermaid">
+flowchart TD
+    GATE{"要不要搜图？（纯规则，不调 LLM）<br/>· 补检轮 text_only → 强制跳过<br/>· 只传图没文字 → 以图搜图<br/>· 意图含 image/visual → 搜<br/>· 问题含「图/照片/结构/现场/曲线/示意/实拍」→ 搜<br/>· 规则层直答命中 → intent_hint 非 need_image，不拉起"}
+
+    GATE -->|"搜"| C1["通道① 文字搜图（主召回）<br/>Chinese-CLIP 文本向量 → 图片 clip 向量<br/>跨模态相似度，召回 20"]
+    GATE -->|"搜"| C2["通道② 描述语义搜<br/>BGE-M3 问题向量 → 图片 AI 描述向量<br/>按中文语义补漏，召回 20"]
+    GATE -->|"搜"| C3["通道③ 图注语义搜<br/>同一 BGE-M3 向量 → 作者原始图注向量<br/>召回 20"]
+    GATE -->|"上传了图"| C4["通道④ 以图搜图<br/>上传图 → CLIP 图像向量<br/>→ 图片库视觉相似，召回 20"]
+
+    C1 --> RRF["RRF 倒数排名融合（k=60，等权）<br/>多通道都命中的图排前面<br/>按 image_id 天然去重"]
+    C2 --> RRF
+    C3 --> RRF
+    C4 --> RRF
+
+    RRF --> BOOST["图文互证提权（排序优先级）<br/>❶ chunk 硬链接：图片登记的切片 ID<br/>　∩ 文本线命中的切片 ID 非空<br/>　→「这张图就是那段文字的配图」<br/>❷ 实体级印证：图片描绘的实体（DEPICTS）<br/>　∩ 意图抽取的查询实体非空<br/>　→「图描绘了用户问的东西」<br/>❸ 再比 RRF 分"]
+
+    BOOST --> TOPK["意图感知定数量<br/>视觉型意图 → 保留全量（默认 5 张）<br/>文本型意图（原因/方案/政策/标准/公式）<br/>→ 压到最少 2 张"]
+
+    TOPK --> VLM["可选：VLM 看图重排<br/>多模态大模型逐张打分（默认关闭，成本高）"]
+
+    VLM --> OUT[/"图片证据<br/>image_id / 描述 / 图注 / 书名页码<br/>互证标记（chunk_link / entity_link）<br/>命中通道来源（clip / description / caption）"/]
+</div>
+<p class="note">降级不阻塞：图片支路任何异常只记 warning，不影响文本结果；图片检索没装配成功（缺 key/集合不存在）时如实报「本次未搜图」，不让结果看起来像「没有图」。</p>
+<p class="note">互证的两条依据都是建库时写进图片向量元数据的：chunk_ids（图片属于哪些切片）、entities（图片 DEPICTS 描绘了哪些图谱实体）——所以图文互证的质量取决于建库阶段的图片清单回填。</p>
+
+<h2>三、检索细节 Ⅲ：图谱线（Neo4j 已发布图谱）</h2>
+<div class="mermaid">
+flowchart TD
+    SCOPE["图谱范围界定<br/>前端选了图谱 → 只认 kg-xxx ID，查询全程带 kg_id 过滤<br/>不选 → 跨全部已发布图谱<br/>（传中文名会被忽略 + 警告）"]
+
+    SCOPE --> RESOLVE["①【新】实体名解析（升级放在「喂名字之前」）<br/>1. 别名表归一：aliases.json 17 条，兜「完全异形词」<br/>　（Al2O3 / 三氧化二铝 → 氧化铝）<br/>2. 全文索引查近似词：entity_name_fulltext（cjk 分析器）<br/>　db.index.fulltext.queryNodes，Lucene 短语查<br/>3. 取库内 canonical 名；任何失败/无命中 → 回落原名<br/>保序去重 + 进程内缓存"]
+
+    RESOLVE --> E1["②a 实体级检索（答具体问题）<br/>取解析后的前 3 个实体名<br/>Cypher <b>逐字未动</b>：n.name CONTAINS $name<br/>AND n.kg_id IN $kg_ids → 向外扩 1~2 跳（上限 50 行）<br/>→ 收集途经节点 + 关系边（去重）"]
+
+    RESOLVE --> E2["②b 主题级检索（答宏观问题）<br/>统计全图实体连接度<br/>→ 取连接最多的前 5 个 hub 实体<br/>作为「这块知识整体讲了哪几块」的主题<br/>每个主题带名字/类型/连接数/所属图谱"]
+
+    E1 --> GUARD["多图谱隔离护栏<br/>路径整体也必须落在选定图谱内<br/>（防止邻居扩展悄悄扩到别的图谱去）"]
+    E2 --> OUT
+
+    GUARD --> OUT[/"图谱证据<br/>每条 = 主语 —[关系]→ 宾语 三元组文本<br/>带 kg_id 溯源（前端显示图谱名）<br/>DEPICTS 边额外带 imageId（图能显示出来）"/]
+
+    OUT --> FALLBACK["降级：图库挂了或超时<br/>→ 返回空 + 警告，不影响文本线<br/>索引不可用 → 解析整体关闭，回到纯 CONTAINS"]
+</div>
+<p class="note">安全口径：图谱查询只用参数化只读 Cypher（白名单模板），禁止 LLM 自由生成查询语句。</p>
+<p class="note">为什么加解析：原来靠 <code>CONTAINS</code> 子串硬碰，用户说「铝电解槽」而库里叫「500kA 预焙阳极电解槽」就一条都匹配不上。现在先把名字换成库内真名，<b>那句 Cypher 一个字没改</b>（<code>test_graph_query_kg_filter.py</code> 断言 Cypher 子串，改了就红）。</p>
+<p class="note">红线由来：Neo4j 里三张图谱的节点/关系都带 kg_id，2026-09-18 前曾混着查——「选了阳极块图谱却答出故障类图谱的结论」就是这么来的，现已全链路隔离。</p>
+<p class="note">范围限定：问答链路走 <code>GraphQueryService</code>，<b>不走</b> <code>/api/v1/kg/*</code> 重端点；KGService 本轮未接实体解析器。</p>
+
+<h2>三、检索细节 Ⅳ：三路汇合与充分性判定</h2>
+<div class="mermaid">
+flowchart TD
+    TXT[/"文本证据（≤top_k 条，带精排分，kind=vector/bm25）"/] --> FUSE
+    KGE[/"图谱证据（三元组，带 kg_id）"/] --> FUSE
+    IMGE[/"图片证据（≤5 张，带互证标记）"/] --> FUSE
+
+    FUSE{"fusion：证据够不够？<br/>规则优先，边缘情形才调 LLM"}
+
+    FUSE -->|"文本 ≥3 条 且 最高精排分 ≥0.8"| ENOUGH["够 → 直接进入生成"]
+    FUSE -->|"文本为空 但 图谱因果边 ≥5"| ENOUGH
+    FUSE -->|"介于两者之间"| LLMJ["让大模型看证据摘要裁定<br/>够 / 不够"]
+    FUSE -->|"明显不足 且 补检 少于 3 轮"| SUPP["supplement：大模型出 ≤3 个补检问题<br/>→ 只重检文本线（图片线跳过）<br/>→ 首轮的图片命中与引用并回，不丢<br/>→ refusion 再判（前端显示「补检 N 轮」）"]
+
+    SUPP --> FUSE
+    LLMJ -->|"不够"| SUPP
+    LLMJ -->|"够"| ENOUGH
+    ENOUGH --> WEBQ{"loop：补检轮次用完后证据仍薄弱？<br/>（无图谱 且 文本 少于 3 条或最高分 低于 0.8）"}
+    REALTIME[/"意图 = realtime_web（实时类）"/] -->|"第 0 轮快速通道<br/>省掉一整轮补检（实测十几秒）"| WEB
+    WEBQ -->|"是 且 联网真可用"| WEB["web_search 抓网页正文当补充证据<br/>答案里披露联网来源"]
+    WEBQ -->|"否"| GEN["→ reason 生成"]
+    WEB --> GEN
+</div>
+<p class="warn">联网当前状态：<code>WEB_SEARCH_ENABLED=1</code> 但博查 <code>WEB_SEARCH_API_KEY</code> <b>留空</b> ⇒ 仍是 <code>DisabledWebSearchTool</code> 占位（不发请求、不产生费用）。<code>web_search_fn</code> 生产环境恒非 None，所以「能不能联网」只能靠 <code>web_search_available()</code> / <code>GraphAgentsV2.web_search_enabled</code> 判定——<b>填上博查 key 重启 8010 即生效，不用再动开关</b>。</p>
+
+<h2>四、SSE 流式（三层同一份合同，8003 只透传）</h2>
+<div class="mermaid">
+sequenceDiagram
+    participant U as 用户
+    participant K as kwp 3000
+    participant B as qa-backend 8003
+    participant A as agent 8010
+    U->>K: 提问（任意模式，可带附图）
+    K->>K: 插入临时气泡 streaming=true（persist=false）
+    K->>B: POST /api/convs/{id}/ask/stream
+    B->>B: user 消息先落 SQLite + db.close()
+    B->>A: POST /api/chat/stream（multipart）
+    A-->>B: start（request_id + steps 预渲染清单）
+    B-->>K: 透传 start
+    K-->>U: 显示阶段文案 + 三点动画（spinner 只有一个）
+    A-->>B: step × N（意图理解/检索规划/图谱检索/RAG检索…）
+    B-->>K: 透传 step（正文为空时才写进气泡）
+    A-->>B: token × N（答案裸增量）
+    B-->>K: 透传 token
+    K-->>U: 80ms 节流逐字绘制，滚动跟随（上翻超 200px 不拽回）
+    A->>A: 证据定序 → 记忆写回 → 附件生成（都在 done 之前）
+    A-->>B: done（与 /api/chat 同构的完整信封）
+    B->>B: 此刻才落 assistant（新开短事务 + _touch）
+    B-->>K: 透传 done（补服务端消息 id）
+    K-->>U: done.answer 覆盖拼接 → 证据卡/角标/缩略图/附件齐全
+</div>
+<table>
+<tr><th>事件</th><th>载荷</th><th>说明</th></tr>
+<tr><td><code>start</code></td><td><code>{request_id, steps}</code></td><td>连接即发；<code>steps</code> = <code>MAIN_PROGRESS_NODES</code> 预渲染清单（意图理解/检索规划/知识图谱检索/RAG 检索/证据融合/补检判定/推理回答/置信评估），<b>故意不含 direct</b>——否则直答时会常驻一个永不完成的步骤</td></tr>
+<tr><td><code>step</code></td><td><code>{node, status, label, seq, elapsed_ms?}</code></td><td>主链节点进度，<code>on_progress</code> 透传；补检节点触发时才动态出现</td></tr>
+<tr><td><code>token</code></td><td><code>{text}</code></td><td>答案裸增量；固定文案类（零证据短路、direct 直答）一次性推一帧，前端不白屏；<b>仅检索</b>模式是 8003 把拼好的正文按行当 token 推（伪流式，行间 30ms）</td></tr>
+<tr><td><code>done</code></td><td>与 <code>/api/chat</code> <b>同构的完整信封</b></td><td><code>code/msg/answer/route/sources/iterations/confidence/warnings/request_id/…/files?</code>；answer 已 <code>normalize_range_tildes</code> 定稿</td></tr>
+<tr><td><code>error</code></td><td><code>{code, msg, request_id}</code></td><td>HTTP 仍 200，沿用 chat_adapter 错误码；传输层错误码 50302</td></tr>
+</table>
+<h3>五条必须知道的坑</h3>
+<ul>
+<li><b>前端以 <code>done.answer</code> 覆盖流式拼接结果</b>：服务端做过区间波浪线归一（<code>20~50V</code> → <code>20–50V</code>）、表格/文档还前置了附件导语，覆盖即自愈，所以流式与一次性两条路径的最终展示必然一致。</li>
+<li><b>五种模式全覆盖，前端不留分支</b>：rag / agent / 带附图 / excel / doc 都是真流式（agent 侧 <code>/api/chat/stream</code> 一路透传）；<b>仅检索</b>因为这条通道压根没有大模型生成（正文由 8003 的 <code>_compose_retrieve_answer</code> 拼装），由 8003 自产 <code>start → step(检索中/检索完，带 elapsed_ms) → token×N（按行，<code>splitlines(keepends=True)</code> 保证拼接与 done 逐字相同）→ done</b> 补齐合同。</li>
+<li><b>8003 只在 done 帧到达才落 assistant</b>：未见 done 就断流 → assistant 以 <code>failed=True</code> 落库（正文 = 已收 token 前缀 + 失败原因），衔接既有 retry 端点原位重试。<code>finally</code> 里保证落库判定恰好一次，且 finally 内不能 yield。</li>
+<li><b><code>reason/conf</code> 的 step 帧在 token 之后才到</b> ⇒ <code>onStep</code> 里必须 <code>if (buf) return</code>，否则正文已经长出来了、阶段文案还在往上盖。</li>
+<li><b>FastAPI ≥0.106 在响应体开始流式输出之前就退出 <code>Depends(get_db)</code></b> ⇒ 流式体内必须新开 <code>SessionLocal()</code>；客户端断开是 <code>CancelledError</code>（BaseException），落库逻辑必须放 <code>finally</code>。</li>
+</ul>
+<p class="note">退化路径只剩<b>一种</b>：装配层没注入 <code>run_query_stream_fn</code>（LLM 未配置也走这里）时，agent 侧直接调 <code>chat()</code> 再包成 <code>start + done</code> 两帧——合同统一，前端不用分支处理。<b>带附图不再退化</b>：图只是给模型多一份上下文（以图搜图 + 图文互证），<code>image</code> 一路透传进流式主链，检索阶段的进度由 <code>step</code> 帧承担，正文照样逐 token 推。</p>
+
+<h2>五、非知识类问题直答分流（五档）</h2>
+<p class="note">起因：用户在产品里输「你好」，得到的回答是「现有知识库证据不足」——意图分类原本只有 13 个电解铝专业标签，没有「这不是知识问题」这一档。</p>
+<table>
+<tr><th>intent</th><th>触发例</th><th>回复</th><th>是否调 LLM</th></tr>
+<tr><td><code>chitchat</code></td><td>你好 / 在吗 / 谢谢 / 再见</td><td>固定文案</td><td>否</td></tr>
+<tr><td><code>self_intro</code></td><td>你是谁 / 你能干什么</td><td>自我介绍（电解铝知识问答机器人）+ 三个<b>实测有答案</b>的示例问题</td><td>否</td></tr>
+<tr><td><code>realtime_web</code></td><td>今天天气 / 最新行情</td><td>联网可用 → 放行走 web_search 支路；不可用 → 降级文案说明</td><td>否</td></tr>
+<tr><td><code>out_of_scope</code></td><td>写代码 / 医疗 / 法律 / 投资</td><td>边界说明（讲清能答什么、这条为什么不答）</td><td>否</td></tr>
+<tr><td><code>casual_qa</code></td><td>讲个笑话 / 123乘以45</td><td>模型直答 + <code>（以上不来自内部知识库）</code>免责句</td><td><b>是</b></td></tr>
+</table>
+<div class="mermaid">
+flowchart TD
+    Q[/"用户问题"/] --> NORM["归一化（去空白 / 标点 / 大小写）"]
+    NORM --> RULE{"第一层闸：规则层<br/>归一化后<b>完全匹配</b>固定说法？<br/>（≤16 字，零 LLM 成本、零风险）"}
+    RULE -->|"命中"| CONF1["parse_confidence = 1.0<br/>intent_hint = 该档<br/>子问题 / BM25 关键词留空<br/>（不是 need_image ⇒ 图片支路不拉起）"]
+    RULE -->|"未命中"| LLM["第二层闸：意图 LLM<br/>13 专业标签 + 5 非知识类<br/>prompt 明写「判不准时一律归上面的专业标签」<br/>带领域词的一律走专业标签"]
+    LLM --> CONF{"parse_confidence ≥ 0.8？"}
+    CONF -->|"是"| DIRECT["direct 节点直答 → END<br/>不检索，1.5~3.3s 出结果<br/>route = direct，前端灰色「💬 直接应答」徽标"]
+    CONF -->|"否"| PIPE["走完整检索管线<br/>（误判成知识问题最多多花几秒）"]
+    CONF1 --> DIRECT
+</div>
+<p class="note">设计原则：<b>误判成知识问题最多多花几秒，误判成寒暄才是真答非所问</b>——所以两层闸都偏保守。<code>offtopic.py</code> 零依赖（只 import os/re/typing），因为 agents_v2 与 graph_v2 都要 import 它，带依赖会成环。</p>
+<p class="note">实测：你好 / 你是谁 / 今天天气怎么样 / 帮我写一个快速排序的代码 → <code>route=direct</code>、sources 0、约 1.5s；讲个笑话 3.3s、123乘以45 2.3s（带免责句）；对照「阳极效应产生的原因和处理步骤」仍 <code>route=vector</code>、16 条证据（graph+vector）、18 处 <code>[[n]]</code> ⇒ 无误分流。</p>
+<p class="note">左栏统计 <code>routeCounts</code> 按 <code>sources.kind</code> 计而非按 <code>route</code> 计；<code>direct</code> 故意不入桶 ⇒ 直答不计入检索统计（它确实没检索）。</p>
+
+<h2>六、证据与引用的呈现</h2>
+<div class="mermaid">
+flowchart LR
+    subgraph AGENT2["agent 产出"]
+        A1["答案正文<br/>引用处标 [[n]]<br/>（流式时逐 token 到达）"]
+        A2["sources 列表（与 n 一一对应）<br/>kind = vector / bm25 / 图谱 / 图片 / 联网<br/>图谱证据带 kgId（score=null）<br/>图片证据与 DEPICTS 三元组带 imageId"]
+        A3["files（excel/doc 模式）<br/>附件 data URL"]
+        A4["meta：改写后问题 / 补检轮数 / 警告 / route"]
+    end
+
+    subgraph KWP2["kwp 渲染"]
+        B0["流式气泡：正文为空时显示阶段文案 + 三点动画<br/>streaming 期间 [[n]] 降级成静态上标<br/>（避免点到还不存在的证据卡）"]
+        B1["[[n]] → 可点上标<br/>点击定位右栏对应证据"]
+        B2["右栏证据面板按类分组<br/>保留原始编号"]
+        B3["imageId → 缩略图<br/>/api/image/{id}?w=320&amp;t=token（8003 代理）"]
+        B4["附件下载卡 ·「补检 N 轮」·「已理解为」<br/>route 徽标（direct = 灰色「💬 直接应答」）"]
+    end
+
+    A1 --> B0 --> B1
+    A2 --> B2
+    A2 --> B3
+    A3 --> B4
+    A4 --> B4
+</div>
+<p class="note">图片显示两条路：① 图谱 DEPICTS 证据（图片实体 → 描绘的图谱实体，123 张）② 图片向量库直接命中的图片证据（覆盖全部 1145 张）。取图走 8003 代理 → agent MinIO 优先、回落本地文件。</p>
+<p class="note">引用顺序为 文本 → 图谱 → 图片 → 联网（20260918 与 kwp sources 分组对齐后的产品口径）。渲染层 <code>marked.parse</code> + <code>useMemo</code> 天然增量，流式重渲染成本可控；仍需 80ms 节流是因为每个 token 都 setState 会把整棵消息树重渲染几十次/秒。</p>
+
+<h2>七、数据源与模型速查</h2>
+<div class="mermaid">
+flowchart LR
+    subgraph Qdrant["Qdrant 向量库"]
+        Q1["文本集合 alrag_exp_bge_m3_hybrid_v2<br/>4951 点 · <b>dense + bm25_sparse 双向量</b>"]
+        Q2["图片集合 alrag_image_cnclip_bge_m3_v2<br/>1145 张 · 三向量"]
+    end
+    subgraph Mongo["MongoDB"]
+        M1["chunks 切片原文<br/>（补上下文用）"]
+        M2["sessions 会话记忆<br/>（多轮追问用）"]
+    end
+    subgraph Neo4j["Neo4j 图库"]
+        N1["已发布实体 7565<br/>三元组带 kg_id<br/><b>+ entity_name_fulltext 全文索引（cjk）</b>"]
+    end
+    subgraph SQL["SQLite（8003 本地）"]
+        S1["会话 / 消息（含 failed 标记）/ 来源快照"]
+    end
+    subgraph Model["模型"]
+        MD1["BGE-M3（语义向量）"]
+        MD2["BGE-reranker-v2-m3（精排）"]
+        MD3["Chinese-CLIP（图文匹配）"]
+        MD4["qwen3.8-max（意图/生成/直答，anthropic 兼容端点）"]
+    end
+    subgraph Eval["评测"]
+        E1["eval_set_v1.jsonl（48 条）<br/>baseline_v1.json + compare_eval.py"]
+    end
+</div>
+
+<h2>八、开关与回退</h2>
+<table>
+<tr><th>开关</th><th>当前值</th><th>关掉 / 回退的效果</th></tr>
+<tr><td><code>ENABLE_SPARSE</code></td><td><code>true</code></td><td>翻 <code>false</code> + 重启 8010 → dense 单路（BM25 上线前行为），秒级</td></tr>
+<tr><td><code>EVIDENCE_MIN_SCORE</code></td><td>未设（默认 0.6）</td><td>设 <code>0</code> → 关闭精排分下限过滤（排障用；会退回「低分片段凑满 top_k、前端显示 1%/2%」的旧行为）</td></tr>
+<tr><td><code>ENTITY_RESOLVER_ENABLED</code></td><td>未设（默认 1）</td><td>设 <code>0</code> → 整体关掉实体解析，回到纯 CONTAINS 子串匹配；<code>DROP INDEX entity_name_fulltext</code> 无残留</td></tr>
+<tr><td><code>DIRECT_REPLY_ENABLED</code></td><td><code>1</code></td><td>设 <code>0</code> + 重启 → <code>direct_fn=None</code>，<code>route_after_spa</code> 恒返 planner，非知识类问题回到「跑完整条链再回证据不足」</td></tr>
+<tr><td><code>WEB_SEARCH_ENABLED</code> / <code>WEB_SEARCH_API_KEY</code></td><td><code>1</code> / <b>空</b></td><td>key 空 = Disabled 占位（不发请求不产生费用）；<b>填博查 key 重启即生效，不用再动开关</b></td></tr>
+<tr><td><code>ARTIFACT_ENABLED</code></td><td><code>1</code></td><td>设 <code>0</code> → 忽略 output_type，不生成表格/文档附件</td></tr>
+</table>
+<p class="note">所有开关都在 gitignored 的 <code>agent/.env</code>，改完必须重启 8010（启动须带 <code>HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONUTF8=1</code>）。流式的回退分三层、互不牵连：kwp 把 <code>if (appendUser)</code> 改回模式白名单即恢复"部分模式一次性"（旧 <code>/ask</code> 端点一行未动，<code>apiAsk</code> 也仍保留）；8003 删掉 <code>_stream_frames</code> 里的 retrieve 分支即让仅检索回到两帧；agent 不注入 <code>run_query_stream_fn</code> 即整体退化成 <code>start + done</code> 两帧。</p>
+
+<h2>九、容易误解的点（实测核实）</h2>
+<ol>
+<li><b>多轮记忆在 agent 侧</b>（Mongo sessions），qa-backend 只传 conversation_id；qa-backend 自己的会话/消息存 SQLite。</li>
+<li><b>BM25 稀疏路已开</b>——不再是 dense 单路；两路分别查 + 应用层 RRF k=60 <b>等权</b>。<code>sources[].kind</code> 会出现 <code>"bm25"</code>。</li>
+<li><b>不是「一次检索就生成」</b>：fusion 判充分性，不够最多补检 3 轮（前端「补检 N 轮」即此）。</li>
+<li><b>图谱检索不限定 ACTIVE 状态</b>：前端不选图谱 = 跨全部已发布图谱查 Neo4j。</li>
+<li><b>实体名解析只改「喂进去的名字」，Cypher 逐字未动</b>。</li>
+<li><b>零证据不调 LLM</b>：直接短路返回「现有知识库证据不足」；<b>但非知识类问题现在压根到不了这一步</b>。</li>
+<li><b>意图不是四分类也不是 13 类</b>：13 个专业标签 + 5 档非知识类，两层闸分流。</li>
+<li><b>流式与一次性共用同一个信封</b>：<code>done</code> 帧 = <code>/api/chat</code> 的完整响应，前端以 <code>done.answer</code> 覆盖拼接结果。<b>现在新提问已经全部走流式</b>（带图 / excel / doc / 仅检索都在内，仅检索是 8003 侧伪流式），一次性只剩失败重试；所以"token 拼接 ≠ done 正文"的两处差异（波浪线归一、附件导语）全靠这次覆盖抹平，不是 bug。</li>
+<li><b>带图不是"一次性"的理由早就没了</b>：以前带图被踢出流式，真实原因只是 <code>run_query_stream_fn</code> 的签名里没有 <code>image</code> 参数（不是"产物是整块结构"）。补上这个参数后带图照常逐字推，图片证据 / 缩略图挂 <code>done.sources</code>。</li>
+<li><b><code>route</code> 有六个值</b>（见第二节末）。</li>
+<li><b>超时链</b>：kwp 首帧 150s（无整体超时）→ qa-backend 120/180s → agent 200s。</li>
+<li><b>流式并发闸 = 3 条流</b>（<code>_ask_semaphore</code> 包住整条流，不是包住一次请求）。</li>
+<li><b>仅检索虽然"没回答"，但不是只在右栏列证据</b>：8003 会把命中片段拼成一段正文（<code>_compose_retrieve_answer</code>，含"未生成回答"的说明），所以它照样有 <code>answer</code>、照样落库、照样进搜索——也正因为有正文可推，才用伪流式让它跟别的模式长得一样。</li>
+</ol>
+
+<h2>十、与 20261006 版的差异</h2>
+<table>
+<tr><th>#</th><th>20261006 版</th><th>现在（20261009）</th></tr>
+<tr><td>1</td><td>BM25 稀疏默认关，dense 单路召回</td><td><b>已开</b>：dense + BM25 双路 → 应用层 RRF k=60 等权</td></tr>
+<tr><td>2</td><td>全链路一次性 JSON，<b>无流式</b></td><td>三层 SSE 打通：<code>/api/chat/stream</code> → 8003 <code>/ask/stream</code> → kwp 逐字渲染（80ms 节流）；<b>五种模式 + 带附图全覆盖</b>（带图/excel/doc 真流式，仅检索由 8003 伪流式补齐），一次性只剩失败重试</td></tr>
+<tr><td>3</td><td>图谱靠 <code>n.name CONTAINS</code> 硬碰</td><td>那句 Cypher 逐字未动，但<b>喂进去的名字先过实体解析</b>（全文索引 cjk + 别名 17 条）</td></tr>
+<tr><td>4</td><td>意图 13 类，<b>无闲聊分支</b></td><td>13 + <b>5 档非知识类</b>；spa 后条件边可 <code>direct → END</code>；<code>route</code> 增 <code>direct</code></td></tr>
+<tr><td>5</td><td>联网兜底默认关闭</td><td>开关已置 <code>WEB_SEARCH_ENABLED=1</code>，仅博查 key 留空 ⇒ 仍是 Disabled 占位；<code>realtime_web</code> 走 loop 首轮快速通道</td></tr>
+<tr><td>6</td><td><code>route</code> 四个值</td><td>六个值（增 <code>web_search</code>、<code>direct</code>）</td></tr>
+<tr><td>—</td><td>—</td><td>另：新增评测集 v1（48 条）+ 质检/对比脚本 + 基线存档；<code>common/llm.py</code> 新增 <code>chat_stream</code>（既有方法一行未动，冻结内核不受影响）</td></tr>
+</table>
+
+<h2>十一、代码锚点速查</h2>
+<pre>
+kwp/app/page.tsx:430                        → send() 提问入口
+kwp/app/page.tsx:451                        → 门闸：新提问一律流式（只有重试走一次性）
+kwp/app/page.tsx:121                        → streamAsk()（80ms 节流、done 覆盖、带 images）
+kwp/lib/stream.ts:75                        → apiAskStream（SSE 解析、首帧 150s）
+kwp/lib/store.ts:225,221                    → apiRetry（重试）/ apiAsk（保留但前端已不调）
+kwp/components/chat.tsx:14,21               → ROUTES 徽标表（含 direct）
+qa-backend/app/routers/convs_router.py:315  → ask 端点（一次性）
+qa-backend/app/routers/convs_router.py:516  → ask/stream 端点（新提问唯一入口）
+qa-backend/app/routers/convs_router.py:424  → _stream_frames（按模式选帧源）
+qa-backend/app/routers/convs_router.py:395  → _retrieve_pseudo_stream（仅检索伪流式）
+qa-backend/app/routers/convs_router.py:436  → 流式落库判定（done 才落 / 断流 failed）
+qa-backend/app/retrieval.py:301,337         → 转发 agent（一次性 / 流式）
+agent/serve/api/capability_routes.py:414    → /api/chat/stream
+agent/serve/api/server_v2.py:794,824        → run_query_stream_fn（按请求编图 + 透传 image）
+agent/serve/services/kb_service.py:171,334  → 主链入口 chat / chat_stream
+agent/serve/services/kb_service.py:375,412  → 退化判定（仅"未装配流式函数"）/ 带图进流式主链
+agent/serve/core/graph_v2.py:156,400,385    → 编图 / route_after_spa / direct 节点
+agent/serve/agents/offtopic.py:127,281      → 规则层完全匹配 / make_direct_fn
+agent/serve/agents/agents_v2.py:265         → 证据定序 enumerate_evidences
+agent/serve/agents/agents_v2.py:492         → 实体名解析接入点
+agent/serve/kg_query/entity_resolver.py:164 → resolve()
+agent/common/stores/qdrant_text_store.py:94 → hybrid_search（双路 + RRF）
+agent/serve/retrievers/text_retriever.py:155 → 文本管线（召回→精排→去重→扩展→预算）
+agent/common/llm.py:356                     → chat_stream（新增，既有 chat 未动）
+agent/serve/services/chat_adapter.py:97,179 → build_sources / determine_route
+</pre>
+<p class="note">详版（逐层 55 条步骤明细，每条带 file:line）：<code>docs/问答检索链路流程图.md</code>；历史快照 <code>…_20261006.md</code> 保留对照，勿再据其行号定位。</p>
+
+<script>mermaid.initialize({startOnLoad:true, theme:'default', flowchart:{useMaxWidth:true, htmlLabels:true}, sequence:{useMaxWidth:true}});</script>
+</body>
+</html>

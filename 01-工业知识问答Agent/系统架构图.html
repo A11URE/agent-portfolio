@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>电解铝知识库多模态问答系统 · 架构图</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body { font-family: "Microsoft YaHei", sans-serif; margin: 20px; background: #f8f9fa; }
+  h1 { border-left: 5px solid #d97706; padding-left: 12px; }
+  h2 { margin-top: 40px; color: #1f2937; }
+  .mermaid { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; }
+  .note { color: #6b7280; font-size: 14px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<h1>电解铝知识库多模态问答系统 · 整体流程（V2）</h1>
+<p class="note">FastAPI · LangGraph 多 Agent · Qdrant Hybrid · BGE 精排 · Neo4j KG</p>
+
+<h2>一、核心：两条线（KG 图谱线 + 知识库线）</h2>
+<div class="mermaid">
+flowchart TD
+    User[/"用户提问：文字 + 可选图片"/]
+    User --> API["API 层<br/>input_guard 输入过滤（拦截恶意请求）<br/>rate_limit 限流（防刷接口）"]
+
+    API --> SPA["spa 节点（公共）<br/>理解问题 + 拆成子问题 + 提取关键词<br/>（一次大模型调用搞定）"]
+
+    SPA --> KG["kg 节点<br/>知识图谱线"]
+    SPA --> RAG["rag 节点<br/>知识库线"]
+
+    subgraph Line1["知识图谱线（Neo4j 图数据库 · 双层检索）"]
+        KG --> KGEntity["实体级检索<br/>找相关实体 + 看它周围的关联"]
+        KG --> KGTheme["主题级检索<br/>找图中连接最多的核心概念"]
+        KGEntity --> Neo4j[("Neo4j 图数据库<br/>实体 + 关系")]
+        KGTheme --> Neo4j
+        Neo4j --> KGOut["图谱证据（带溯源）"]
+    end
+
+    subgraph Line2["知识库线（Qdrant 向量库 + MongoDB）"]
+        RAG --> RAGText["文本检索<br/>双重搜索（语义+关键词）<br/>+ 精排 + 去重 + 补上下文"]
+        RAG --> RAGImg["图片检索<br/>文字搜图 + 以图搜图"]
+        RAGText --> Qdrant[("Qdrant 向量库<br/>文字的数字向量")]
+        RAGImg --> Qdrant
+        RAGText --> Mongo[("MongoDB<br/>切片原文")]
+        Qdrant --> RAGOut["文本 + 图片证据（带溯源）"]
+    end
+
+    KGOut --> Fusion["fusion 节点<br/>证据融合：判断证据够不够<br/>（规则优先 + 大模型兜底）"]
+    RAGOut --> Fusion
+
+    Fusion --> Loop["loop 节点<br/>补检判定（最多 3 轮）"]
+    Loop --> Reason["reason 节点<br/>推理：证据不足直接拒答"]
+    Reason --> Conf["conf 节点<br/>置信度评估 + 实体溯源约束<br/>（查询实体未在图谱溯源 → 降置信度）"]
+    Conf --> Result[/"返回：答案 + 溯源证据链 + 置信度"/]
+</div>
+<p class="note">补检回路：判断证据不够且有新方向时，回到 spa 生成补充问题、只补文本检索（最多 3 轮）。</p>
+<p class="note">实体溯源约束：conf 节点会检查查询抽出的实体是否在图谱证据中溯源到，未溯源到的实体会降低置信度，抑制「证据之外」的编造。</p>
+
+<h2>二、知识图谱线（双层检索）</h2>
+<div class="mermaid">
+flowchart TD
+    KG["kg 节点<br/>用识别出的实体去查图"]
+
+    KG --> E1["① 实体级检索（entity_retrieve）"]
+    KG --> E2["② 主题级检索（theme_retrieve）"]
+
+    E1 --> E11["定位实体<br/>按名字在图中找到这个实体"]
+    E11 --> E12["邻居扩展<br/>看它周围 1~N 跳的关联实体"]
+    E12 --> E13["关系边<br/>实体A —关系→ 实体B"]
+
+    E2 --> E21["统计连接数<br/>找出连接最多的实体"]
+    E21 --> E22["主题<br/>核心概念 + 类型 + 连接数"]
+
+    E13 --> OUT["图谱证据<br/>结构化、可溯源"]
+    E22 --> OUT
+
+    OUT --> Note["降级：图库挂了或超时<br/>→ 返回空 + 警告，不影响知识库线"]
+</div>
+
+<h2>三、知识库线（文本 + 图片检索）</h2>
+<div class="mermaid">
+flowchart TD
+    Planner["拆子问题（最多 3 路并行）"] --> RAG["rag 节点"]
+
+    RAG --> Text["文本检索"]
+    RAG --> Img["图片检索"]
+
+    Text --> T1["① 语义搜索<br/>Dense 向量（BGE-M3）<br/>按意思找相似的"]
+    Text --> T2["② 关键词搜索<br/>BM25（字面词匹配）"]
+    T1 --> TF["合并排序（RRF）"]
+    T2 --> TF
+    TF --> T3["精排<br/>重新打分排序（分数压到 0~1）"]
+    T3 --> T4["去重<br/>删重复片段 + 每篇限量"]
+    T4 --> T5["补上下文<br/>补上前一句后一句"]
+    T5 --> T6["控制长度（8000 token 内）"]
+    T6 --> T7["文本证据<br/>带来源定位"]
+
+    Img --> I1["① 图文匹配搜索<br/>Chinese-CLIP 跨模态<br/>文字和图片算相似度"]
+    Img --> I2["② 描述语义搜索<br/>BGE-M3 对图片描述<br/>按中文语义补漏"]
+    Img --> I3["③ 以图搜图<br/>CLIP 图像向量<br/>上传图找视觉相似"]
+    I1 --> F["合并排序（RRF）<br/>三路倒数排名融合"]
+    I2 --> F
+    I3 --> F
+
+    F --> F2["图文互证提权"]
+
+    F2 --> C1["① 切片硬链接"]
+    F2 --> C2["② 实体级印证"]
+
+    C1 --> C11["文本检索命中切片<br/>收集 chunk_id 集合"]
+    C11 --> C12["与图片登记的 chunk_ids<br/>求交集"]
+    C12 --> C13["有交集 → chunk_boost<br/>「图是那段文字的配图」"]
+
+    C2 --> C21["意图抽取查询实体"]
+    C21 --> C22["图片 DEPICTS 描绘的实体"]
+    C22 --> C23["实体有交集 → entity_boost<br/>「图描绘了用户问的东西」"]
+
+    C13 --> F3["重排：互证命中优先<br/>再比 RRF 分"]
+    C23 --> F3
+
+    F3 --> F4["按意图调节图片数量<br/>视觉型问题（结构/现场/外观）<br/>答案靠图 → 全量返回（默认 5 张）<br/>文本型问题（原因/方案/政策）<br/>答案靠文字 → 只返回 2 张"]
+    F4 --> F5["VLM 重排<br/>多模态大模型看图 + 读题<br/>对图片逐张打分重排"]
+    F5 --> F6["图片证据<br/>带来源定位 + 互证标记"]
+</div>
+<p class="note">图文互证两条路，命中任一即把该图排前：① 切片硬链接——文本检索命中了哪些切片（chunk_id 集合），图片登记时记录了它属于哪些切片（chunk_ids），两者求交集；有交集说明「这张图就是那段文字的配图」，记 chunk_boost。② 实体级印证——图片经 DEPICTS 关系描绘了哪些实体，与意图抽取出的查询实体求交集；有交集说明「这张图描绘了用户问的东西」，记 entity_boost。两条路都命中后，互证命中的图排前，再比 RRF 分。</p>
+<p class="note">按意图调节图片数量：先看用户问题属于哪种意图——问结构、现场、外观这类视觉型问题，答案需要配图，就保留全量图片；问原因、方案、政策这类文字型问题，图片只是辅助，就压到最少（2 张）。</p>
+<p class="note">VLM 重排：用多模态大模型对召回图片「看图 + 读题」逐张打分重排，是精度天花板，但每张图多一次 LLM 调用、成本高，待评测集建起后再开启。</p>
+
+<h2>四、离线建库 + 抽取流程</h2>
+<div class="mermaid">
+flowchart TD
+    Input[/"规则化文件 + 切片"/]
+
+    Input --> T1["抽取服务<br/>用大模型从切片抽三元组"]
+    T1 --> T2["候选三元组<br/>带来源（文档 + 切片 + 原文证据）"]
+    T2 --> T3{"人工审核"}
+    T3 -->|"通过"| T4["发布进正式图谱"]
+    T4 --> Neo4j[("Neo4j 图数据库")]
+    T3 -->|"驳回 / 修改"| T2
+
+    Input --> I1["切片 → 向量化（转成数字向量）"]
+    I1 --> Qdrant[("Qdrant 向量库")]
+    I1 --> Mongo[("MongoDB 切片原文")]
+
+    Input --> I2["图片信息整合<br/>doc_extractor 抽图 + 图注 + 上下文<br/>通义千问生成描述"]
+    I2 --> I2a["实体抽取<br/>从图注/描述抽 12 类实体"]
+    I2 --> I2b["向量化 + 元数据<br/>CLIP 图向量 + 描述向量<br/>entities / section_path / chunk_ids"]
+    I2a --> I2c["建 DEPICTS 关系<br/>图片 → 图谱实体"]
+    I2b --> QdrantImg[("Qdrant 图片库<br/>双向量 + 元数据")]
+    I2c --> Neo4j
+</div>
+<p class="note">图片线产出两样东西进 Neo4j：Image 节点（图注/描述/上下文/章节路径等全字段）和 DEPICTS 关系（图→实体）；同时把双向量 + entities + section_path + chunk_ids 写进 Qdrant 图片库，供检索时图文互证。文本三元组与图片三元组汇到同一个 Neo4j，构成完整图谱。</p>
+
+<h2>五、存储与模型职责</h2>
+<div class="mermaid">
+flowchart LR
+    subgraph Qdrant["Qdrant 向量库（存数字向量）"]
+        Q1["文字：语义 + 关键词"]
+        Q2["图片：图文 + 描述"]
+    end
+    subgraph Mongo["MongoDB 文档库（存原文）"]
+        M1["切片原文"]
+        M2["前后文指针"]
+    end
+    subgraph Neo4j["Neo4j 图库（存实体关系）"]
+        N1["13 类实体"]
+        N2["13 类关系"]
+        N3["图片 + 描绘关系"]
+    end
+    subgraph Model["模型"]
+        MD1["BGE-M3（语义向量）"]
+        MD2["BGE-reranker（精排打分）"]
+        MD3["Chinese-CLIP（图文匹配）"]
+    end
+</div>
+
+<script>mermaid.initialize({startOnLoad:true, theme:'default'});</script>
+</body>
+</html>

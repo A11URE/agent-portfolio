@@ -1,0 +1,38 @@
+# ---- 凭据与密钥：绝不允许进仓库 ----
+.env
+.env.*
+*.env
+!*.env.example
+*.key
+*.pem
+id_rsa*
+*.p12
+*.pfx
+*凭据*
+*凭据*.md
+*密钥*
+credentials*
+secrets*
+*连接参数*
+keys/
+
+# ---- 个人隐私 ----
+简历*.pdf
+简历*.doc*
+*简历*
+
+# ---- 系统与编辑器 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# ---- 临时产物 ----
+*.log
+*.tmp
+__pycache__/
+*.pyc
+node_modules/
+.tmp/
